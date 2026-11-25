@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="ko" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 스포츠 픽스터 대시보드</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    body { background-color: #0f172a; color: #f1f5f9; font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+  <!-- 데모 모드 안내 배너 -->
+  <div id="demo-banner" class="hidden bg-amber-500/20 border-b border-amber-500/40 text-amber-200 text-xs sm:text-sm text-center py-2 px-4">
+    ⚠️ 현재 <b>미리보기(데모) 모드</b>입니다. <code>app.js</code> 상단에 Supabase URL과 Anon Key를 입력하면 실제 DB와 연동됩니다.
+  </div>
+
+  <!-- 상단 네비게이션 -->
+  <header class="bg-slate-900/90 backdrop-blur border-b border-slate-800 sticky top-0 z-30">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-2 cursor-pointer" onclick="switchTab('dashboard')">
+        <span class="text-2xl">🤖</span>
+        <div>
+          <h1 class="font-bold text-lg leading-tight text-white">AI 스포츠 픽스터</h1>
+          <p class="text-[11px] text-slate-400">NBA &amp; 유럽축구 통계 분석 · 가상배팅</p>
+        </div>
+      </div>
+
+      <nav class="flex items-center gap-1 sm:gap-2 text-sm overflow-x-auto">
+        <button id="tab-dashboard" onclick="switchTab('dashboard')" class="nav-btn px-3 py-1.5 rounded-lg font-medium bg-indigo-600 text-white">📊 AI 분석</button>
+        <button id="tab-schedule" onclick="switchTab('schedule')" class="nav-btn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:bg-slate-800">📅 경기일정</button>
+        <button id="tab-ledger" onclick="switchTab('ledger')" class="nav-btn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:bg-slate-800">💵 가상배팅</button>
+        <button id="tab-board" onclick="switchTab('board')" class="nav-btn px-3 py-1.5 rounded-lg font-medium text-slate-300 hover:bg-slate-800">💬 게시판</button>
+      </nav>
+
+      <div id="auth-area" class="flex items-center gap-2 text-sm">
+        <button onclick="openAuthModal()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200">
+          로그인 / 가입
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- 메인 콘텐츠 -->
+  <main class="max-w-6xl w-full mx-auto px-4 py-6 flex-1">
+
+    <!-- 1. 대시보드 & AI 분석 섹션 -->
+    <section id="sec-dashboard" class="space-y-6">
+      <!-- KPI 요약 카드 -->
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p class="text-xs text-slate-400">전체 적중률</p>
+          <p id="kpi-hitrate" class="text-2xl font-bold text-white mt-1">-</p>
+          <p id="kpi-record" class="text-xs text-slate-400 mt-1">0전 0승 0패</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p class="text-xs text-slate-400">누적 순수익 (1만원 기준)</p>
+          <p id="kpi-profit" class="text-2xl font-bold text-emerald-400 mt-1">-</p>
+          <p id="kpi-pending" class="text-xs text-slate-400 mt-1">대기중 0건</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p class="text-xs text-slate-400">누적 수익률 (ROI)</p>
+          <p id="kpi-roi" class="text-2xl font-bold text-indigo-400 mt-1">-</p>
+          <p class="text-xs text-slate-400 mt-1">배팅 대비 수익률</p>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <p class="text-xs text-slate-400">⭐⭐⭐ 주력 픽 성적</p>
+          <p id="kpi-tier3" class="text-2xl font-bold text-amber-400 mt-1">-</p>
+          <p id="kpi-tier3-roi" class="text-xs text-slate-400 mt-1">ROI -</p>
+        </div>
+      </div>
+
+      <!-- BEST PICKS -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
+        <h2 class="text-base font-bold text-white flex items-center gap-2 mb-3">
+          🏆 <span>오늘의 AI 픽스터 BEST PICKS</span>
+        </h2>
+        <div id="best-picks-list" class="space-y-2 text-sm"></div>
+      </div>
+
+      <!-- 경기별 상세 분석 -->
+      <div>
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+          <h2 class="text-base font-bold text-white">🔍 경기별 상세 분석</h2>
+          <div id="sport-filter-btns" class="flex gap-2 text-xs">
+            <button onclick="filterAnalyses('ALL')" class="filter-chip px-3 py-1.5 rounded-full bg-indigo-600 text-white">전체</button>
+            <button onclick="filterAnalyses('NBA')" class="filter-chip px-3 py-1.5 rounded-full bg-slate-800 text-slate-300">🏀 NBA</button>
+            <button onclick="filterAnalyses('SOCCER')" class="filter-chip px-3 py-1.5 rounded-full bg-slate-800 text-slate-300">⚽ 유럽축구</button>
+          </div>
+        </div>
+        <div id="analyses-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+      </div>
+    </section>
+
+    <!-- 2. 경기 일정 섹션 -->
+    <section id="sec-schedule" class="hidden space-y-4">
+      <h2 class="text-lg font-bold text-white">📅 향후 통합 경기 일정 (KST)</h2>
+      <div id="schedule-container" class="space-y-4"></div>
+    </section>
+
+    <!-- 3. 가상배팅 장부 섹션 -->
+    <section id="sec-ledger" class="hidden space-y-4">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-lg font-bold text-white">💵 가상 배팅 장부 (1경기 10,000원 기준)</h2>
+        <select id="ledger-filter" onchange="renderLedger()" class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-200">
+          <option value="ALL">전체 상태</option>
+          <option value="PENDING">대기중 (PENDING)</option>
+          <option value="WON">적중 (WON)</option>
+          <option value="LOST">미적 (LOST)</option>
+        </select>
+      </div>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
+        <table class="w-full text-left text-xs sm:text-sm whitespace-nowrap">
+          <thead class="bg-slate-800/70 text-slate-300">
+            <tr>
+              <th class="px-4 py-3">종목</th>
+              <th class="px-4 py-3">경기</th>
+              <th class="px-4 py-3">AI 픽</th>
+              <th class="px-4 py-3">배당 / EV</th>
+              <th class="px-4 py-3">결과</th>
+              <th class="px-4 py-3">손익</th>
+              <th class="px-4 py-3">일시</th>
+            </tr>
+          </thead>
+          <tbody id="ledger-tbody" class="divide-y divide-slate-800"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 4. 커뮤니티 게시판 섹션 -->
+    <section id="sec-board" class="hidden space-y-4">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 class="text-lg font-bold text-white">💬 픽 공유 &amp; 자유 게시판</h2>
+          <p class="text-xs text-slate-400">부상자 소식, 라인업 정보, 경기 의견을 자유롭게 나눠보세요. (불법 홍보글 즉시 삭제)</p>
+        </div>
+        <button onclick="openPostModal()" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium">
+          ✏️ 글쓰기
+        </button>
+      </div>
+
+      <div class="flex gap-2 text-xs">
+        <button onclick="filterPosts('전체')" class="post-cat-btn px-3 py-1.5 rounded-full bg-indigo-600 text-white">전체</button>
+        <button onclick="filterPosts('자유')" class="post-cat-btn px-3 py-1.5 rounded-full bg-slate-800 text-slate-300">자유</button>
+        <button onclick="filterPosts('분석공유')" class="post-cat-btn px-3 py-1.5 rounded-full bg-slate-800 text-slate-300">분석공유</button>
+        <button onclick="filterPosts('적중인증')" class="post-cat-btn px-3 py-1.5 rounded-full bg-slate-800 text-slate-300">적중인증</button>
+      </div>
+
+      <div id="board-list" class="bg-slate-900 border border-slate-800 rounded-xl divide-y divide-slate-800"></div>
+    </section>
+  </main>
+
+  <footer class="border-t border-slate-800 py-5 text-center text-xs text-slate-500 px-4">
+    본 사이트의 분석은 통계 모델 기반 참고 자료이며, 가상 배팅 시뮬레이션 결과는 실제 수익을 보장하지 않습니다.
+  </footer>
+
+  <!-- 로그인 / 회원가입 모달 -->
+  <div id="auth-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-sm w-full p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 id="auth-modal-title" class="text-lg font-bold text-white">로그인</h3>
+        <button onclick="closeAuthModal()" class="text-slate-400 hover:text-white">✕</button>
+      </div>
+      <div class="space-y-3">
+        <input id="login-nickname" type="text" placeholder="닉네임 (회원가입 시)" class="hidden w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white" />
+        <input id="login-email" type="email" placeholder="이메일" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white" />
+        <input id="login-password" type="password" placeholder="비밀번호 (6자 이상)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white" />
+        <button id="btn-auth-submit" onclick="submitAuth()" class="w-full py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold">로그인</button>
+      </div>
+      <div class="text-center text-xs text-slate-400">
+        <button id="btn-toggle-auth-mode" onclick="toggleAuthMode()" class="underline hover:text-white">계정이 없으신가요? 회원가입</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 글쓰기 모달 -->
+  <div id="post-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="text-lg font-bold text-white">새 게시글 작성</h3>
+        <button onclick="closePostModal()" class="text-slate-400 hover:text-white">✕</button>
+      </div>
+      <div class="space-y-3">
+        <select id="post-category" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white">
+          <option value="자유">자유</option>
+          <option value="분석공유">분석공유</option>
+          <option value="적중인증">적중인증</option>
+        </select>
+        <input id="post-title" type="text" placeholder="제목을 입력하세요" maxlength="80" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white" />
+        <textarea id="post-content" rows="5" placeholder="내용을 입력하세요 (불법 사이트 홍보/도배 금지)" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white"></textarea>
+        <button onclick="submitPost()" class="w-full py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold">등록하기</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 게시글 상세 + 댓글 모달 -->
+  <div id="post-detail-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full max-h-[85vh] flex flex-col">
+      <div class="p-5 border-b border-slate-800 flex justify-between items-start gap-3">
+        <div>
+          <span id="detail-category" class="text-xs px-2 py-0.5 rounded bg-indigo-600/30 text-indigo-300"></span>
+          <h3 id="detail-title" class="text-lg font-bold text-white mt-1"></h3>
+          <p id="detail-meta" class="text-xs text-slate-400 mt-1"></p>
+        </div>
+        <button onclick="closeDetailModal()" class="text-slate-400 hover:text-white text-lg">✕</button>
+      </div>
+      <div class="p-5 overflow-y-auto space-y-5 flex-1">
+        <p id="detail-content" class="text-sm text-slate-200 whitespace-pre-wrap leading-relaxed"></p>
+        <div id="detail-actions" class="flex justify-end"></div>
+
+        <div class="border-t border-slate-800 pt-4 space-y-3">
+          <h4 class="text-sm font-semibold text-slate-300">💬 댓글</h4>
+          <div id="detail-comments" class="space-y-2"></div>
+          <div class="flex gap-2 pt-2">
+            <input id="comment-input" type="text" placeholder="댓글을 입력하세요..." class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white" />
+            <button onclick="submitComment()" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium">등록</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
