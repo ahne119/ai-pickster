@@ -1,4 +1,5 @@
 from difflib import SequenceMatcher
+import html as html_lib
 import math
 import os
 import re
@@ -34,6 +35,15 @@ _sb_client = (
     if (create_client and SUPABASE_URL and SUPABASE_SERVICE_KEY)
     else None
 )
+
+# 구글 블로거 API 설정 (Secrets에 등록 시 자동 발행)
+BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID", "")
+BLOGGER_CLIENT_ID = os.getenv("BLOGGER_CLIENT_ID", "")
+BLOGGER_CLIENT_SECRET = os.getenv("BLOGGER_CLIENT_SECRET", "")
+BLOGGER_REFRESH_TOKEN = os.getenv("BLOGGER_REFRESH_TOKEN", "")
+
+WEB_SITE_URL = os.getenv("WEB_SITE_URL", "https://ahne119.github.io/ai-pickster/")
+TELEGRAM_CHANNEL_URL = "https://t.me/AIPCK"
 
 AUTO_INTERVAL_HOURS = 24
 BET_STAKE_KRW = 10000
@@ -123,6 +133,13 @@ def is_telegram_enabled() -> bool:
     token_ok = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN.strip() and "여기에_" not in TELEGRAM_BOT_TOKEN)
     chan_ok = bool(TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID.strip() and "여기에_" not in TELEGRAM_CHANNEL_ID)
     return token_ok and chan_ok
+
+
+def is_blogger_enabled() -> bool:
+    return all(
+        bool(v and v.strip())
+        for v in (BLOGGER_BLOG_ID, BLOGGER_CLIENT_ID, BLOGGER_CLIENT_SECRET, BLOGGER_REFRESH_TOKEN)
+    )
 
 
 def normalize_team_name(name: str) -> str:
@@ -223,7 +240,7 @@ def calc_ev_pct(prob_pct: float, decimal_odd: float | None) -> float | None:
 
 
 # =========================================================
-# 🏀 PART 1. NBA 모듈
+# 🏀 PART 1. NBA 모듈 (공식 API + 클라우드용 백업 엔진)
 # =========================================================
 def get_current_nba_season() -> str:
     now = pd.Timestamp.now(tz="Asia/Seoul")
@@ -259,12 +276,85 @@ def get_nba_team_context(team_id: int, game_date_et: str, season_df: pd.DataFram
     }
 
 
+def build_nba_fallback_stats(schedule_df: pd.DataFrame) -> tuple[dict, float]:
+    """stats.nba.com 차단 시 ScheduleLeagueV2의 시즌 종료 경기들로 팀 득실점 통계를 계산합니다."""
+    finished = schedule_df[
+        (schedule_df["gameStatus"] == 3)
+        & schedule_df["homeTeam_score"].notna()
+        & schedule_df["awayTeam_score"].notna()
+    ].copy()
+
+    # 정규시즌/플레이오프 경기 우선 (프리시즌 001 제외)
+    reg = finished[finished["gameId"].astype(str).str.startswith(("002", "004"))]
+    if len(reg) >= 20:
+        finished = reg
+
+    if finished.empty:
+        return {}, 113.0
+
+    team_games = {}
+    all_pts = []
+    for _, r in finished.iterrows():
+        hid, aid = int(r["homeTeam_teamId"]), int(r["awayTeam_teamId"])
+        hs, aws = float(r["homeTeam_score"]), float(r["awayTeam_score"])
+        gdate = r["game_date_et"]
+        all_pts.extend([hs, aws])
+        team_games.setdefault(hid, []).append((gdate, hs, aws, "W" if hs > aws else "L"))
+        team_games.setdefault(aid, []).append((gdate, aws, hs, "W" if aws > hs else "L"))
+
+    league_avg_ppg = sum(all_pts) / len(all_pts) if all_pts else 113.0
+    stats_map = {}
+    prior = 3.0
+
+    for tid, gl in team_games.items():
+        gl.sort(key=lambda x: x[0] or "", reverse=True)
+        n = len(gl)
+        s_for = (sum(x[1] for x in gl) + prior * league_avg_ppg) / (n + prior)
+        s_agn = (sum(x[2] for x in gl) + prior * league_avg_ppg) / (n + prior)
+        l10 = gl[:10]
+        l_for = sum(x[1] for x in l10) / len(l10)
+        l_agn = sum(x[2] for x in l10) / len(l10)
+
+        eff_for = s_for * 0.6 + l_for * 0.4
+        eff_agn = s_agn * 0.6 + l_agn * 0.4
+        stats_map[tid] = {
+            "eff_for": eff_for,
+            "eff_agn": eff_agn,
+            "net_ppg": eff_for - eff_agn,
+            "games": gl,
+        }
+    return stats_map, league_avg_ppg
+
+
+def get_nba_fallback_context(team_id: int, game_date_et: str, stats_map: dict, league_avg_ppg: float) -> dict:
+    info = stats_map.get(team_id)
+    if not info:
+        return {
+            "eff_for": league_avg_ppg, "eff_agn": league_avg_ppg,
+            "net_ppg": 0.0, "is_b2b": False, "recent_5": "정보없음",
+        }
+    prev_games = [g for g in info["games"] if g[0] and game_date_et and g[0] < game_date_et]
+    rest_days, recent_5 = None, "정보없음"
+    if prev_games:
+        last_date = datetime.strptime(prev_games[0][0], "%Y-%m-%d")
+        target_date = datetime.strptime(game_date_et, "%Y-%m-%d")
+        rest_days = (target_date - last_date).days
+        recent_5 = "".join(g[3] for g in prev_games[:5])
+    return {
+        "eff_for": info["eff_for"],
+        "eff_agn": info["eff_agn"],
+        "net_ppg": info["net_ppg"],
+        "is_b2b": (rest_days == 1),
+        "recent_5": recent_5,
+    }
+
+
 def run_nba_module(now_kst: pd.Timestamp):
     season = get_current_nba_season()
-    print(f"📡 [NBA] {season} 시즌 공식 데이터를 불러오는 중...")
+    print(f"📡 [NBA] {season} 시즌 데이터를 불러오는 중...")
 
-    schedule_df = scheduleleaguev2.ScheduleLeagueV2(season=season, timeout=45).season_games.get_data_frame()
-    time.sleep(0.8)
+    schedule_df = scheduleleaguev2.ScheduleLeagueV2(season=season, timeout=30).season_games.get_data_frame()
+    time.sleep(0.5)
 
     schedule_df["dt_utc"] = pd.to_datetime(schedule_df["gameDateTimeUTC"], utc=True, errors="coerce")
     schedule_df = schedule_df.dropna(subset=["dt_utc"]).copy()
@@ -272,19 +362,26 @@ def run_nba_module(now_kst: pd.Timestamp):
     schedule_df["game_date_et"] = pd.to_datetime(schedule_df["gameDateTimeEst"], errors="coerce").dt.strftime("%Y-%m-%d")
     schedule_df = schedule_df.sort_values("dt_kst")
 
-    season_df = leaguedashteamstats.LeagueDashTeamStats(
-        season=season, season_type_all_star="Regular Season", measure_type_detailed_defense="Advanced", timeout=45
-    ).get_data_frames()[0]
-    time.sleep(0.8)
+    use_official_stats = False
+    season_df = last10_df = logs_df = None
+    fallback_stats, league_avg_ppg = {}, 113.0
 
-    last10_df = leaguedashteamstats.LeagueDashTeamStats(
-        season=season, season_type_all_star="Regular Season", measure_type_detailed_defense="Advanced", last_n_games=10, timeout=45
-    ).get_data_frames()[0]
-    time.sleep(0.8)
-
-    logs_df = leaguegamelog.LeagueGameLog(
-        season=season, season_type_all_star="Regular Season", player_or_team_abbreviation="T", direction="DESC", sorter="DATE", timeout=45
-    ).get_data_frames()[0]
+    try:
+        season_df = leaguedashteamstats.LeagueDashTeamStats(
+            season=season, season_type_all_star="Regular Season", measure_type_detailed_defense="Advanced", timeout=12
+        ).get_data_frames()[0]
+        time.sleep(0.5)
+        last10_df = leaguedashteamstats.LeagueDashTeamStats(
+            season=season, season_type_all_star="Regular Season", measure_type_detailed_defense="Advanced", last_n_games=10, timeout=12
+        ).get_data_frames()[0]
+        time.sleep(0.5)
+        logs_df = leaguegamelog.LeagueGameLog(
+            season=season, season_type_all_star="Regular Season", player_or_team_abbreviation="T", direction="DESC", sorter="DATE", timeout=12
+        ).get_data_frames()[0]
+        use_official_stats = True
+    except Exception as e:
+        print(f"⚠️ [NBA] 공식 스탯 서버 응답 지연 -> 일정 기반 득실점 백업 모델로 전환합니다 ({type(e).__name__})")
+        fallback_stats, league_avg_ppg = build_nba_fallback_stats(schedule_df)
 
     settled_lookup = {}
     finished_nba = schedule_df[schedule_df["gameStatus"] == 3]
@@ -339,28 +436,39 @@ def run_nba_module(now_kst: pd.Timestamp):
         print("💰 [배당] NBA 실시간 배당률을 불러오는 중...")
         nba_odds_events = fetch_odds_events("basketball_nba", region="us")
 
-    valid_ids = set(season_df["TEAM_ID"].values)
-    league_avg_ortg = season_df["OFF_RATING"].mean()
+    valid_ids = set(season_df["TEAM_ID"].values) if use_official_stats else set()
+    league_avg_ortg = season_df["OFF_RATING"].mean() if use_official_stats else 114.0
     reports, top_picks, analysis_rows = [], [], []
 
     for _, game in upcoming_df.iterrows():
         home_id, away_id = int(game["homeTeam_teamId"]), int(game["awayTeam_teamId"])
-        if home_id not in valid_ids or away_id not in valid_ids:
+        home_code, away_code = game["homeTeam_teamTricode"], game["awayTeam_teamTricode"]
+        if not home_code or not away_code:
             continue
 
-        home_code, away_code = game["homeTeam_teamTricode"], game["awayTeam_teamTricode"]
         home_full = f"{game['homeTeam_teamCity']} {game['homeTeam_teamName']}".strip()
         away_full = f"{game['awayTeam_teamCity']} {game['awayTeam_teamName']}".strip()
 
-        h_ctx = get_nba_team_context(home_id, game["game_date_et"], season_df, last10_df, logs_df)
-        a_ctx = get_nba_team_context(away_id, game["game_date_et"], season_df, last10_df, logs_df)
+        if use_official_stats and home_id in valid_ids and away_id in valid_ids:
+            h_ctx = get_nba_team_context(home_id, game["game_date_et"], season_df, last10_df, logs_df)
+            a_ctx = get_nba_team_context(away_id, game["game_date_et"], season_df, last10_df, logs_df)
 
-        expected_pace = (h_ctx["pace"] + a_ctx["pace"]) / 2.0
-        h_exp_ortg = h_ctx["ortg"] + a_ctx["drtg"] - league_avg_ortg
-        a_exp_ortg = a_ctx["ortg"] + h_ctx["drtg"] - league_avg_ortg
+            expected_pace = (h_ctx["pace"] + a_ctx["pace"]) / 2.0
+            h_exp_ortg = h_ctx["ortg"] + a_ctx["drtg"] - league_avg_ortg
+            a_exp_ortg = a_ctx["ortg"] + h_ctx["drtg"] - league_avg_ortg
 
-        h_pred_pts = (h_exp_ortg / 100.0) * expected_pace + 1.2
-        a_pred_pts = (a_exp_ortg / 100.0) * expected_pace - 1.2
+            h_pred_pts = (h_exp_ortg / 100.0) * expected_pace + 1.2
+            a_pred_pts = (a_exp_ortg / 100.0) * expected_pace - 1.2
+            h_net, a_net, metric_name = h_ctx["net_rtg"], a_ctx["net_rtg"], "공수마진(NetRtg)"
+            pace_txt = f"예상 페이스 {expected_pace:.1f}"
+        else:
+            h_ctx = get_nba_fallback_context(home_id, game["game_date_et"], fallback_stats, league_avg_ppg)
+            a_ctx = get_nba_fallback_context(away_id, game["game_date_et"], fallback_stats, league_avg_ppg)
+
+            h_pred_pts = h_ctx["eff_for"] + (a_ctx["eff_agn"] - league_avg_ppg) + 1.2
+            a_pred_pts = a_ctx["eff_for"] + (h_ctx["eff_agn"] - league_avg_ppg) - 1.2
+            h_net, a_net, metric_name = h_ctx["net_ppg"], a_ctx["net_ppg"], "득실점마진(PPG)"
+            pace_txt = "득실점 백업모델"
 
         if h_ctx["is_b2b"]:
             h_pred_pts -= 1.5
@@ -400,11 +508,11 @@ def run_nba_module(now_kst: pd.Timestamp):
             )
 
         reasons = []
-        if abs(h_ctx["net_rtg"] - a_ctx["net_rtg"]) >= 4.0:
-            better = home_code if h_ctx["net_rtg"] > a_ctx["net_rtg"] else away_code
-            reasons.append(f"• 공수마진(NetRtg) {better} 우위 (홈 {h_ctx['net_rtg']:+.1f} vs 원정 {a_ctx['net_rtg']:+.1f})")
+        if abs(h_net - a_net) >= 3.5:
+            better = home_code if h_net > a_net else away_code
+            reasons.append(f"• {metric_name} {better} 우위 (홈 {h_net:+.1f} vs 원정 {a_net:+.1f})")
         else:
-            reasons.append(f"• 공수마진(NetRtg) 호각세 (홈 {h_ctx['net_rtg']:+.1f} vs 원정 {a_ctx['net_rtg']:+.1f})")
+            reasons.append(f"• {metric_name} 호각세 (홈 {h_net:+.1f} vs 원정 {a_net:+.1f})")
 
         if h_ctx["is_b2b"] or a_ctx["is_b2b"]:
             b2b_list = [t for cond, t in [(h_ctx["is_b2b"], f"홈 {home_code}"), (a_ctx["is_b2b"], f"원정 {away_code}")] if cond]
@@ -421,7 +529,7 @@ def run_nba_module(now_kst: pd.Timestamp):
             f"📊 예측 스코어 : {away_code} {a_pred_pts:.1f} - {h_pred_pts:.1f} {home_code}\n"
             f"📈 승리 확률   : {away_code} {away_win_prob:.1f}% | {home_code} {home_win_prob:.1f}%"
             f"{odds_line}\n"
-            f"🔥 예상 총득점 : {total_pts:.1f}점 (예상 페이스 {expected_pace:.1f})\n"
+            f"🔥 예상 총득점 : {total_pts:.1f}점 ({pace_txt})\n"
             f"🎯 픽스터 추천 : [{pick_team} 승] (예상핸디 {spread_str}) | {conf}\n"
             f"📝 분석 근거   :\n" + "\n".join(reasons)
         )
@@ -446,7 +554,7 @@ def run_nba_module(now_kst: pd.Timestamp):
             "pick_ev": round(pick_ev, 1) if pick_ev is not None else None,
             "tier": tier_score,
             "conf_label": conf,
-            "extra_info": f"예상 총득점 {total_pts:.1f}점 (페이스 {expected_pace:.1f}) | 예상핸디 {spread_str}",
+            "extra_info": f"예상 총득점 {total_pts:.1f}점 ({pace_txt}) | 예상핸디 {spread_str}",
             "reasons": "\n".join(reasons),
         })
 
@@ -999,7 +1107,7 @@ def build_virtual_wallet_report(records: list[dict], settled_msgs: list[str], pl
 
 
 # =========================================================
-# 📨 PART 4. 텔레그램 공개 채널 자동 발송 모듈
+# 📨 PART 4. 텔레그램 & 구글 블로거 자동 발송 모듈
 # =========================================================
 def split_message_chunks(text: str, max_len: int = 3800) -> list[str]:
     if len(text) <= max_len:
@@ -1065,6 +1173,177 @@ def send_telegram_channel(blocks: list[str]):
 
     if sent_count == len(all_chunks):
         print(f"✅ 텔레그램 채널({TELEGRAM_CHANNEL_ID}) 발송 완료! ({sent_count}/{len(all_chunks)}건)")
+
+
+def build_blogger_html(now_kst: pd.Timestamp, top_picks: list, analyses: list, schedule_rows: list, ledger_records: list) -> tuple[str, str]:
+    end_kst = now_kst + pd.Timedelta(days=2)
+    date_range_str = f"{now_kst.strftime('%m/%d')} ~ {end_kst.strftime('%m/%d')}"
+    ampm = "오전" if now_kst.hour < 12 else "오후"
+    post_title = f"🤖 AI 스포츠 픽스터 통합 리포트 ({date_range_str} {ampm})"
+    esc = html_lib.escape
+
+    settled = [r for r in ledger_records if r["status"] in ("WON", "LOST")]
+    wins = sum(1 for r in settled if r["status"] == "WON")
+    losses = sum(1 for r in settled if r["status"] == "LOST")
+    total_games = wins + losses
+    hit_rate = (wins / total_games * 100) if total_games else 0.0
+    net_profit = sum(int(r["profit"]) for r in settled)
+    total_stake = sum(int(r["stake"]) for r in settled)
+    roi = (net_profit / total_stake * 100) if total_stake else 0.0
+
+    # 1. BEST PICKS 테이블 행
+    sorted_picks = sorted(top_picks, key=lambda x: (x["tier"], x["prob"]), reverse=True)[:10]
+    pick_rows_html = ""
+    for idx, p in enumerate(sorted_picks, 1):
+        tier_badge = (
+            '<span style="background:#fef3c7;color:#b45309;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐⭐ 주력</span>'
+            if p["tier"] == 3
+            else '<span style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐ 일반</span>'
+        )
+        odd_str = f"{p['odd']:.2f}" if p.get("odd") else "-"
+        ev_badge = ""
+        if p.get("ev") is not None:
+            ev_bg = "#d1fae5;color:#065f46" if p["ev"] >= 5 else "#f1f5f9;color:#334155"
+            gem = " 💎" if p["ev"] >= 5 else ""
+            ev_badge = f' <span style="background:{ev_bg};padding:3px 7px;border-radius:6px;font-size:12px;font-weight:700;">EV {p["ev"]:+.1f}%{gem}</span>'
+
+        pick_rows_html += f"""
+        <tr style="border-bottom:1px solid #e2e8f0;">
+          <td style="padding:12px 8px;text-align:center;color:#64748b;font-weight:600;">{idx}</td>
+          <td style="padding:12px 8px;">{esc(p['sport'])}</td>
+          <td style="padding:12px 8px;font-weight:600;color:#0f172a;">{esc(p['match'])}</td>
+          <td style="padding:12px 8px;"><b>{esc(p['pick'])}</b> ({p['prob']:.1f}%) {tier_badge}</td>
+          <td style="padding:12px 8px;">{odd_str}{ev_badge}</td>
+          <td style="padding:12px 8px;color:#475569;font-size:13px;">{esc(p['time'])}</td>
+        </tr>"""
+
+    if not pick_rows_html:
+        pick_rows_html = '<tr><td colspan="6" style="padding:18px;text-align:center;color:#64748b;">현재 추천 기준에 부합하는 경기가 없습니다.</td></tr>'
+
+    # 2. 상세 분석 카드
+    analysis_cards_html = ""
+    for a in analyses[:16]:
+        probs_txt = (
+            f"홈 {a['home_prob']:.1f}% | 무 {a['draw_prob']:.1f}% | 원정 {a['away_prob']:.1f}%"
+            if a.get("draw_prob") is not None
+            else f"원정 {a['away_prob']:.1f}% | 홈 {a['home_prob']:.1f}%"
+        )
+        analysis_cards_html += f"""
+        <div style="border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin-bottom:14px;background:#ffffff;">
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:#64748b;margin-bottom:6px;">
+            <span style="font-weight:700;color:#1d4ed8;">{esc(a['sport'])}</span>
+            <span>{esc(a['kickoff_kst'])}</span>
+          </div>
+          <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:4px;">
+            {esc(a['home_team'])} (홈) vs {esc(a['away_team'])} (원정)
+          </div>
+          <div style="font-size:13px;color:#1e40af;margin-bottom:6px;">{esc(a['pred_summary'])}</div>
+          <div style="font-size:13px;color:#334155;margin-bottom:4px;">📈 승률: {probs_txt}</div>
+          <div style="font-size:13px;color:#475569;margin-bottom:8px;">🔥 {esc(a['extra_info'])}</div>
+          <div style="background:#f8fafc;border-radius:8px;padding:10px;font-size:12px;color:#475569;white-space:pre-line;margin-bottom:8px;">{esc(a['reasons'])}</div>
+          <div style="font-size:13px;font-weight:700;color:#059669;">🎯 AI 추천: {esc(a['pick_label'])} · {esc(a['conf_label'])}</div>
+        </div>"""
+
+    if not analysis_cards_html:
+        analysis_cards_html = '<p style="color:#64748b;">예정된 분석 경기가 없습니다.</p>'
+
+    html_body = f"""
+<div style="max-width:860px;margin:0 auto;font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',sans-serif;line-height:1.6;color:#1e293b;">
+  <div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a8a 100%);color:#ffffff;padding:24px 26px;border-radius:14px;margin-bottom:18px;">
+    <div style="font-size:22px;font-weight:800;margin-bottom:6px;">🤖 AI 스포츠 픽스터 통합 리포트 ({date_range_str})</div>
+    <div style="font-size:13px;color:#cbd5e1;">생성 시각: {esc(format_kst_datetime(now_kst))} | 대상 종목: NBA · EPL · 라리가 · 분데스리가 · 세리에 A · 챔피언스리그</div>
+  </div>
+
+  <div style="background:#f0f7ff;border:1px solid #bfdbfe;border-radius:12px;padding:18px 20px;margin-bottom:20px;">
+    <div style="font-size:15px;font-weight:700;color:#1e3a8a;margin-bottom:6px;">📊 실시간 AI 대시보드 &amp; 커뮤니티 오픈!</div>
+    <div style="font-size:14px;color:#334155;margin-bottom:14px;">
+      실시간 경기 일정, 누적 가상배팅 성적표, 회원 커뮤니티 게시판은 웹사이트에서 바로 확인하실 수 있습니다.
+    </div>
+    <a href="{esc(WEB_SITE_URL)}" target="_blank" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:700;margin-right:8px;margin-bottom:6px;">🌐 AI 픽스터 웹사이트 바로가기</a>
+    <a href="{esc(TELEGRAM_CHANNEL_URL)}" target="_blank" style="display:inline-block;background:#0284c7;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:700;margin-bottom:6px;">✈️ 텔레그램 채널 바로가기</a>
+  </div>
+
+  <p style="font-size:14px;color:#334155;margin-bottom:22px;">
+    다가오는 주요 NBA 및 유럽 5대 프로축구 리그 경기의 AI 통계 모델 예측 리포트입니다. 핵심 주력 픽 TOP 10과 누적 가상배팅 성적, 상세 기대 득점 및 해외 배당 기댓값(EV)을 확인해 보세요.
+  </p>
+
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">
+    🏆 오늘의 AI 픽스터 핵심 추천 요약 (BEST PICKS)
+  </div>
+  <div style="overflow-x:auto;border:1px solid #e2e8f0;border-radius:12px;background:#ffffff;margin-bottom:26px;">
+    <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:620px;">
+      <thead>
+        <tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;color:#475569;text-align:left;">
+          <th style="padding:12px 8px;text-align:center;">순위</th>
+          <th style="padding:12px 8px;">종목/리그</th>
+          <th style="padding:12px 8px;">매치업</th>
+          <th style="padding:12px 8px;">AI 추천 픽 (확률)</th>
+          <th style="padding:12px 8px;">배당 / 기댓값(EV)</th>
+          <th style="padding:12px 8px;">경기 일시 (KST)</th>
+        </tr>
+      </thead>
+      <tbody>{pick_rows_html}</tbody>
+    </table>
+  </div>
+
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">
+    💵 AI 가상 배팅 누적 성적표 (1만원 기준)
+  </div>
+  <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;font-size:14px;margin-bottom:26px;">
+    <b>누적 전적:</b> {total_games}전 {wins}승 {losses}패 (적중률 {hit_rate:.1f}%) &nbsp;|&nbsp;
+    <b>순수익:</b> <span style="color:{'#059669' if net_profit >= 0 else '#e11d48'};font-weight:700;">{net_profit:+,d}원</span> (ROI {roi:+.1f}%)
+  </div>
+
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">
+    🔍 경기별 AI 상세 분석
+  </div>
+  {analysis_cards_html}
+
+  <p style="font-size:12px;color:#94a3b8;margin-top:28px;border-top:1px solid #e2e8f0;padding-top:12px;">
+    ※ 본 게시물은 통계 모델 기반 자동 분석 리포트이며, 가상 배팅 시뮬레이션 결과는 실제 수익을 보장하지 않습니다.
+  </p>
+</div>
+"""
+    return post_title, html_body
+
+
+def publish_to_blogger(title: str, html_content: str, labels: list[str] | None = None):
+    if not is_blogger_enabled():
+        print("\nℹ️ [블로거] API 설정이 없어 블로그 자동 발행은 건너뜁니다.")
+        return
+
+    try:
+        token_resp = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": BLOGGER_CLIENT_ID,
+                "client_secret": BLOGGER_CLIENT_SECRET,
+                "refresh_token": BLOGGER_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+            timeout=20,
+        )
+        token_resp.raise_for_status()
+        access_token = token_resp.json()["access_token"]
+
+        post_url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOGGER_BLOG_ID}/posts/"
+        payload = {
+            "kind": "blogger#post",
+            "blog": {"id": BLOGGER_BLOG_ID},
+            "title": title,
+            "content": html_content,
+            "labels": labels or ["NBA", "유럽축구", "AI픽스터"],
+        }
+        res = requests.post(
+            post_url,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=25,
+        )
+        res.raise_for_status()
+        print(f"📝 [블로거] 자동 포스팅 완료! -> {res.json().get('url', '')}")
+    except Exception as e:
+        print(f"⚠️ [블로거] 포스팅 실패: {e}")
 
 
 # =========================================================
@@ -1191,6 +1470,10 @@ def execute_bot(run_nba: bool, run_soccer: bool):
         tg_blocks.append(footer_txt)
         send_telegram_channel(tg_blocks)
 
+    if "--no-blog" not in sys.argv and all_analyses:
+        blog_title, blog_html = build_blogger_html(now_kst, all_top_picks, all_analyses, all_schedule_rows, ledger_records)
+        publish_to_blogger(blog_title, blog_html)
+
 
 def run_24h_auto_loop():
     print(f"🔁 {AUTO_INTERVAL_HOURS}시간 자동 반복 모드를 시작합니다. (중지하려면 Ctrl+C 를 누르세요)")
@@ -1227,7 +1510,7 @@ def main():
         return
 
     print("==================================================")
-    print("🤖 AI 스포츠 픽스터 통합 봇 (텔레그램 + 웹 DB 연동)")
+    print("🤖 AI 스포츠 픽스터 통합 봇 (텔레그램 + 웹 + 블로거)")
     print("==================================================")
     print("1. 1회 전체 실행 (NBA + 유럽축구)")
     print("2. 🏀 NBA만 보기")
