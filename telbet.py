@@ -8,11 +8,6 @@ import time
 from datetime import datetime
 import pandas as pd
 import requests
-from nba_api.stats.endpoints import (
-    leaguedashteamstats,
-    leaguegamelog,
-    scheduleleaguev2,
-)
 
 try:
     from supabase import create_client
@@ -60,7 +55,7 @@ TARGET_SOCCER_LEAGUES = {
 }
 
 SCHEDULE_DAYS = 3
-NBA_ANALYSIS_HOURS = 36
+NBA_ANALYSIS_HOURS = 48
 SOCCER_ANALYSIS_HOURS = 48
 SAVE_TO_FILE = True
 REPORT_FILENAME = "pickster_report.txt"
@@ -69,8 +64,18 @@ REPORT_FILENAME = "pickster_report.txt"
 WEEKDAYS_KR = ["월", "화", "수", "목", "금", "토", "일"]
 FOOTBALL_BASE_URL = "https://api.football-data.org/v4"
 ODDS_BASE_URL = "https://api.the-odds-api.com/v4"
+ESPN_NBA_BASE = "https://site.api.espn.com/apis"
 _rate_limit_wait_until = 0.0
 _odds_remaining_credits = None
+
+ESPN_TRICODE_MAP = {
+    "GS": "GSW",
+    "NO": "NOP",
+    "NY": "NYK",
+    "SA": "SAS",
+    "UTAH": "UTA",
+    "WSH": "WAS",
+}
 
 LEDGER_COLUMNS = [
     "bet_id", "placed_at_kst", "kickoff_kst", "sport", "match",
@@ -240,240 +245,223 @@ def calc_ev_pct(prob_pct: float, decimal_odd: float | None) -> float | None:
 
 
 # =========================================================
-# 🏀 PART 1. NBA 모듈 (공식 API + 클라우드용 백업 엔진)
+# 🏀 PART 1. NBA 모듈 (ESPN 공식 JSON API 기반)
 # =========================================================
-def get_current_nba_season() -> str:
-    now = pd.Timestamp.now(tz="Asia/Seoul")
-    year = now.year
-    return f"{year}-{str(year + 1)[-2:]}" if now.month >= 10 else f"{year - 1}-{str(year)[-2:]}"
+def normalize_nba_tricode(abbr: str) -> str:
+    up = (abbr or "").upper().strip()
+    return ESPN_TRICODE_MAP.get(up, up)
 
 
-def get_nba_team_context(team_id: int, game_date_et: str, season_df: pd.DataFrame, last10_df: pd.DataFrame, logs_df: pd.DataFrame) -> dict:
-    s_row = season_df[season_df["TEAM_ID"] == team_id].iloc[0]
-    l_row_df = last10_df[last10_df["TEAM_ID"] == team_id]
-    l_row = l_row_df.iloc[0] if not l_row_df.empty else s_row
+def fetch_espn_nba_standings() -> tuple[dict, float]:
+    url = f"{ESPN_NBA_BASE}/v2/sports/basketball/nba/standings"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
 
-    eff_ortg = s_row["OFF_RATING"] * 0.6 + l_row["OFF_RATING"] * 0.4
-    eff_drtg = s_row["DEF_RATING"] * 0.6 + l_row["DEF_RATING"] * 0.4
-    eff_pace = s_row["PACE"] * 0.6 + l_row["PACE"] * 0.4
+    team_stats = {}
+    all_ppg = []
+    for conf in data.get("children", []):
+        for entry in conf.get("standings", {}).get("entries", []):
+            team = entry.get("team", {})
+            code = normalize_nba_tricode(team.get("abbreviation", ""))
+            if not code:
+                continue
 
-    team_logs = logs_df[(logs_df["TEAM_ID"] == team_id) & (logs_df["GAME_DATE"] < game_date_et)]
-    rest_days, recent_5 = None, "정보없음"
+            st_map = {s.get("name"): s for s in entry.get("stats", []) if s.get("name")}
+            ppg_for = st_map.get("avgPointsFor", {}).get("value")
+            ppg_agn = st_map.get("avgPointsAgainst", {}).get("value")
+            wins = int(st_map.get("wins", {}).get("value", 0) or 0)
+            losses = int(st_map.get("losses", {}).get("value", 0) or 0)
 
-    if not team_logs.empty and pd.notna(game_date_et):
-        last_date = datetime.strptime(team_logs.iloc[0]["GAME_DATE"], "%Y-%m-%d")
-        target_date = datetime.strptime(game_date_et, "%Y-%m-%d")
-        rest_days = (target_date - last_date).days
-        recent_5 = "".join(team_logs.head(5)["WL"].tolist())
+            if ppg_for is not None:
+                all_ppg.append(float(ppg_for))
 
-    return {
-        "ortg": eff_ortg,
-        "drtg": eff_drtg,
-        "net_rtg": eff_ortg - eff_drtg,
-        "pace": eff_pace,
-        "is_b2b": (rest_days == 1),
-        "recent_5": recent_5,
-    }
+            team_stats[code] = {
+                "ppg_for": float(ppg_for) if ppg_for is not None else None,
+                "ppg_agn": float(ppg_agn) if ppg_agn is not None else None,
+                "record": f"{wins}-{losses}",
+            }
 
+    league_avg_ppg = sum(all_ppg) / len(all_ppg) if all_ppg else 113.5
+    for code, st in team_stats.items():
+        if st["ppg_for"] is None:
+            st["ppg_for"] = league_avg_ppg
+        if st["ppg_agn"] is None:
+            st["ppg_agn"] = league_avg_ppg
+        st["net_ppg"] = st["ppg_for"] - st["ppg_agn"]
 
-def build_nba_fallback_stats(schedule_df: pd.DataFrame) -> tuple[dict, float]:
-    """stats.nba.com 차단 시 ScheduleLeagueV2의 시즌 종료 경기들로 팀 득실점 통계를 계산합니다."""
-    finished = schedule_df[
-        (schedule_df["gameStatus"] == 3)
-        & schedule_df["homeTeam_score"].notna()
-        & schedule_df["awayTeam_score"].notna()
-    ].copy()
-
-    # 정규시즌/플레이오프 경기 우선 (프리시즌 001 제외)
-    reg = finished[finished["gameId"].astype(str).str.startswith(("002", "004"))]
-    if len(reg) >= 20:
-        finished = reg
-
-    if finished.empty:
-        return {}, 113.0
-
-    team_games = {}
-    all_pts = []
-    for _, r in finished.iterrows():
-        hid, aid = int(r["homeTeam_teamId"]), int(r["awayTeam_teamId"])
-        hs, aws = float(r["homeTeam_score"]), float(r["awayTeam_score"])
-        gdate = r["game_date_et"]
-        all_pts.extend([hs, aws])
-        team_games.setdefault(hid, []).append((gdate, hs, aws, "W" if hs > aws else "L"))
-        team_games.setdefault(aid, []).append((gdate, aws, hs, "W" if aws > hs else "L"))
-
-    league_avg_ppg = sum(all_pts) / len(all_pts) if all_pts else 113.0
-    stats_map = {}
-    prior = 3.0
-
-    for tid, gl in team_games.items():
-        gl.sort(key=lambda x: x[0] or "", reverse=True)
-        n = len(gl)
-        s_for = (sum(x[1] for x in gl) + prior * league_avg_ppg) / (n + prior)
-        s_agn = (sum(x[2] for x in gl) + prior * league_avg_ppg) / (n + prior)
-        l10 = gl[:10]
-        l_for = sum(x[1] for x in l10) / len(l10)
-        l_agn = sum(x[2] for x in l10) / len(l10)
-
-        eff_for = s_for * 0.6 + l_for * 0.4
-        eff_agn = s_agn * 0.6 + l_agn * 0.4
-        stats_map[tid] = {
-            "eff_for": eff_for,
-            "eff_agn": eff_agn,
-            "net_ppg": eff_for - eff_agn,
-            "games": gl,
-        }
-    return stats_map, league_avg_ppg
+    return team_stats, league_avg_ppg
 
 
-def get_nba_fallback_context(team_id: int, game_date_et: str, stats_map: dict, league_avg_ppg: float) -> dict:
-    info = stats_map.get(team_id)
-    if not info:
-        return {
-            "eff_for": league_avg_ppg, "eff_agn": league_avg_ppg,
-            "net_ppg": 0.0, "is_b2b": False, "recent_5": "정보없음",
-        }
-    prev_games = [g for g in info["games"] if g[0] and game_date_et and g[0] < game_date_et]
-    rest_days, recent_5 = None, "정보없음"
-    if prev_games:
-        last_date = datetime.strptime(prev_games[0][0], "%Y-%m-%d")
-        target_date = datetime.strptime(game_date_et, "%Y-%m-%d")
-        rest_days = (target_date - last_date).days
-        recent_5 = "".join(g[3] for g in prev_games[:5])
-    return {
-        "eff_for": info["eff_for"],
-        "eff_agn": info["eff_agn"],
-        "net_ppg": info["net_ppg"],
-        "is_b2b": (rest_days == 1),
-        "recent_5": recent_5,
-    }
+def fetch_espn_nba_games(now_kst: pd.Timestamp) -> list[dict]:
+    now_et = now_kst.tz_convert("America/New_York")
+    seen_ids = set()
+    games = []
+
+    # 최근 7일(정산/연전/최근5경기용) + 향후 3일(일정/예측용)
+    for offset in range(-7, SCHEDULE_DAYS + 1):
+        d_str = (now_et + pd.Timedelta(days=offset)).strftime("%Y%m%d")
+        url = f"{ESPN_NBA_BASE}/site/v2/sports/basketball/nba/scoreboard"
+        try:
+            resp = requests.get(url, params={"dates": d_str}, timeout=15)
+            resp.raise_for_status()
+            events = resp.json().get("events", [])
+        except Exception as e:
+            print(f"⚠️ [NBA ESPN] {d_str} 조회 실패: {e}")
+            continue
+
+        for ev in events:
+            ev_id = str(ev.get("id", ""))
+            if not ev_id or ev_id in seen_ids:
+                continue
+            seen_ids.add(ev_id)
+
+            comps = ev.get("competitions", [])
+            if not comps:
+                continue
+            comp = comps[0]
+            competitors = comp.get("competitors", [])
+            home_c = next((c for c in competitors if c.get("homeAway") == "home"), None)
+            away_c = next((c for c in competitors if c.get("homeAway") == "away"), None)
+            if not home_c or not away_c:
+                continue
+
+            dt_utc = pd.to_datetime(ev.get("date"), utc=True, errors="coerce")
+            if pd.isna(dt_utc):
+                continue
+            dt_kst = dt_utc.tz_convert("Asia/Seoul")
+            date_et = dt_utc.tz_convert("America/New_York").strftime("%Y-%m-%d")
+
+            st_type = comp.get("status", {}).get("type", {})
+            state = st_type.get("state", "pre")  # pre, in, post
+            detail = st_type.get("shortDetail") or st_type.get("detail") or ""
+
+            def extract_rec(comp_obj):
+                recs = comp_obj.get("records", [])
+                for r in recs:
+                    if r.get("type") == "total" or r.get("name") in ("overall", "YTD"):
+                        return r.get("summary", "0-0")
+                return recs[0].get("summary", "0-0") if recs else "0-0"
+
+            h_team = home_c.get("team", {})
+            a_team = away_c.get("team", {})
+            h_score = home_c.get("score")
+            a_score = away_c.get("score")
+
+            games.append({
+                "game_id": ev_id,
+                "dt_utc": dt_utc,
+                "dt_kst": dt_kst,
+                "date_et": date_et,
+                "state": state,
+                "detail": detail,
+                "home_code": normalize_nba_tricode(h_team.get("abbreviation", "")),
+                "away_code": normalize_nba_tricode(a_team.get("abbreviation", "")),
+                "home_full": h_team.get("displayName") or h_team.get("name") or "",
+                "away_full": a_team.get("displayName") or a_team.get("name") or "",
+                "home_rec": extract_rec(home_c),
+                "away_rec": extract_rec(away_c),
+                "home_score": int(h_score) if (h_score is not None and str(h_score).isdigit()) else 0,
+                "away_score": int(a_score) if (a_score is not None and str(a_score).isdigit()) else 0,
+            })
+
+    games.sort(key=lambda x: x["dt_kst"])
+    return games
 
 
 def run_nba_module(now_kst: pd.Timestamp):
-    season = get_current_nba_season()
-    print(f"📡 [NBA] {season} 시즌 데이터를 불러오는 중...")
-
-    schedule_df = scheduleleaguev2.ScheduleLeagueV2(season=season, timeout=30).season_games.get_data_frame()
-    time.sleep(0.5)
-
-    schedule_df["dt_utc"] = pd.to_datetime(schedule_df["gameDateTimeUTC"], utc=True, errors="coerce")
-    schedule_df = schedule_df.dropna(subset=["dt_utc"]).copy()
-    schedule_df["dt_kst"] = schedule_df["dt_utc"].dt.tz_convert("Asia/Seoul")
-    schedule_df["game_date_et"] = pd.to_datetime(schedule_df["gameDateTimeEst"], errors="coerce").dt.strftime("%Y-%m-%d")
-    schedule_df = schedule_df.sort_values("dt_kst")
-
-    use_official_stats = False
-    season_df = last10_df = logs_df = None
-    fallback_stats, league_avg_ppg = {}, 113.0
-
-    try:
-        season_df = leaguedashteamstats.LeagueDashTeamStats(
-            season=season, season_type_all_star="Regular Season", measure_type_detailed_defense="Advanced", timeout=12
-        ).get_data_frames()[0]
-        time.sleep(0.5)
-        last10_df = leaguedashteamstats.LeagueDashTeamStats(
-            season=season, season_type_all_star="Regular Season", measure_type_detailed_defense="Advanced", last_n_games=10, timeout=12
-        ).get_data_frames()[0]
-        time.sleep(0.5)
-        logs_df = leaguegamelog.LeagueGameLog(
-            season=season, season_type_all_star="Regular Season", player_or_team_abbreviation="T", direction="DESC", sorter="DATE", timeout=12
-        ).get_data_frames()[0]
-        use_official_stats = True
-    except Exception as e:
-        print(f"⚠️ [NBA] 공식 스탯 서버 응답 지연 -> 일정 기반 득실점 백업 모델로 전환합니다 ({type(e).__name__})")
-        fallback_stats, league_avg_ppg = build_nba_fallback_stats(schedule_df)
+    print("📡 [NBA] ESPN 공식 데이터를 불러오는 중...")
+    team_stats, league_avg_ppg = fetch_espn_nba_standings()
+    games = fetch_espn_nba_games(now_kst)
 
     settled_lookup = {}
-    finished_nba = schedule_df[schedule_df["gameStatus"] == 3]
-    for _, r in finished_nba.iterrows():
-        if pd.isna(r["homeTeam_score"]) or pd.isna(r["awayTeam_score"]):
+    team_recent_logs = {}
+
+    for g in games:
+        if g["state"] != "post":
             continue
-        hs, aws = int(r["homeTeam_score"]), int(r["awayTeam_score"])
-        settled_lookup[f"NBA_{r['gameId']}"] = {
+        hs, aws = g["home_score"], g["away_score"]
+        if hs == aws:
+            continue
+        settled_lookup[f"NBA_{g['game_id']}"] = {
             "status": "FINISHED",
             "winner": "home" if hs > aws else "away",
             "score": f"{aws}:{hs} (원정:홈)",
         }
+        team_recent_logs.setdefault(g["home_code"], []).append((g["date_et"], g["dt_utc"], "W" if hs > aws else "L"))
+        team_recent_logs.setdefault(g["away_code"], []).append((g["date_et"], g["dt_utc"], "W" if aws > hs else "L"))
+
+    for code in team_recent_logs:
+        team_recent_logs[code].sort(key=lambda x: x[1], reverse=True)
 
     start_bound = now_kst - pd.Timedelta(hours=3)
     end_bound = now_kst + pd.Timedelta(days=SCHEDULE_DAYS)
-    sched_window = schedule_df[(schedule_df["dt_kst"] >= start_bound) & (schedule_df["dt_kst"] <= end_bound)]
 
     schedule_rows = []
-    for _, row in sched_window.iterrows():
-        away_c, home_c = row["awayTeam_teamTricode"], row["homeTeam_teamTricode"]
-        a_w = 0 if pd.isna(row["awayTeam_wins"]) else int(row["awayTeam_wins"])
-        a_l = 0 if pd.isna(row["awayTeam_losses"]) else int(row["awayTeam_losses"])
-        h_w = 0 if pd.isna(row["homeTeam_wins"]) else int(row["homeTeam_wins"])
-        h_l = 0 if pd.isna(row["homeTeam_losses"]) else int(row["homeTeam_losses"])
-
-        st = row["gameStatus"]
-        if st == 1:
+    for g in games:
+        if not (start_bound <= g["dt_kst"] <= end_bound):
+            continue
+        if g["state"] == "pre":
             badge = "예정"
+        elif g["state"] == "in":
+            badge = f"진행중 {g['away_score']}:{g['home_score']}"
         else:
-            a_s = 0 if pd.isna(row["awayTeam_score"]) else int(row["awayTeam_score"])
-            h_s = 0 if pd.isna(row["homeTeam_score"]) else int(row["homeTeam_score"])
-            badge = f"{'진행중' if st == 2 else '종료'} {a_s}:{h_s}"
+            badge = f"종료 {g['away_score']}:{g['home_score']}"
+
+        h_rec = team_stats.get(g["home_code"], {}).get("record") or g["home_rec"]
+        a_rec = team_stats.get(g["away_code"], {}).get("record") or g["away_rec"]
 
         schedule_rows.append({
-            "schedule_id": f"NBA_{row['gameId']}",
-            "kickoff_iso": row["dt_utc"].isoformat(),
-            "dt_kst": row["dt_kst"],
+            "schedule_id": f"NBA_{g['game_id']}",
+            "kickoff_iso": g["dt_utc"].isoformat(),
+            "dt_kst": g["dt_kst"],
             "sport_tag": "🏀 NBA",
-            "matchup": f"[원정] {away_c}({a_w}-{a_l}) @ [홈] {home_c}({h_w}-{h_l})",
+            "matchup": f"[원정] {g['away_code']}({a_rec}) @ [홈] {g['home_code']}({h_rec})",
             "badge": badge,
         })
 
     analysis_end = now_kst + pd.Timedelta(hours=NBA_ANALYSIS_HOURS)
-    upcoming_df = schedule_df[
-        (schedule_df["gameStatus"] == 1)
-        & (schedule_df["dt_kst"] >= now_kst)
-        & (schedule_df["dt_kst"] <= analysis_end)
+    upcoming_games = [
+        g for g in games
+        if g["state"] == "pre" and now_kst <= g["dt_kst"] <= analysis_end
     ]
 
     nba_odds_events = []
-    if not upcoming_df.empty and is_odds_enabled():
+    if upcoming_games and is_odds_enabled():
         print("💰 [배당] NBA 실시간 배당률을 불러오는 중...")
         nba_odds_events = fetch_odds_events("basketball_nba", region="us")
 
-    valid_ids = set(season_df["TEAM_ID"].values) if use_official_stats else set()
-    league_avg_ortg = season_df["OFF_RATING"].mean() if use_official_stats else 114.0
     reports, top_picks, analysis_rows = [], [], []
 
-    for _, game in upcoming_df.iterrows():
-        home_id, away_id = int(game["homeTeam_teamId"]), int(game["awayTeam_teamId"])
-        home_code, away_code = game["homeTeam_teamTricode"], game["awayTeam_teamTricode"]
+    for game in upcoming_games:
+        home_code, away_code = game["home_code"], game["away_code"]
         if not home_code or not away_code:
             continue
 
-        home_full = f"{game['homeTeam_teamCity']} {game['homeTeam_teamName']}".strip()
-        away_full = f"{game['awayTeam_teamCity']} {game['awayTeam_teamName']}".strip()
+        home_full, away_full = game["home_full"], game["away_full"]
+        h_st = team_stats.get(home_code, {"ppg_for": league_avg_ppg, "ppg_agn": league_avg_ppg, "net_ppg": 0.0})
+        a_st = team_stats.get(away_code, {"ppg_for": league_avg_ppg, "ppg_agn": league_avg_ppg, "net_ppg": 0.0})
 
-        if use_official_stats and home_id in valid_ids and away_id in valid_ids:
-            h_ctx = get_nba_team_context(home_id, game["game_date_et"], season_df, last10_df, logs_df)
-            a_ctx = get_nba_team_context(away_id, game["game_date_et"], season_df, last10_df, logs_df)
+        def get_recent_ctx(code: str, target_et: str):
+            logs = [x for x in team_recent_logs.get(code, []) if x[0] < target_et]
+            if not logs:
+                return False, "정보없음"
+            last_dt = datetime.strptime(logs[0][0], "%Y-%m-%d")
+            tgt_dt = datetime.strptime(target_et, "%Y-%m-%d")
+            is_b2b = ((tgt_dt - last_dt).days == 1)
+            recent_5 = "".join(x[2] for x in logs[:5])
+            return is_b2b, recent_5
 
-            expected_pace = (h_ctx["pace"] + a_ctx["pace"]) / 2.0
-            h_exp_ortg = h_ctx["ortg"] + a_ctx["drtg"] - league_avg_ortg
-            a_exp_ortg = a_ctx["ortg"] + h_ctx["drtg"] - league_avg_ortg
+        h_b2b, h_rec5 = get_recent_ctx(home_code, game["date_et"])
+        a_b2b, a_rec5 = get_recent_ctx(away_code, game["date_et"])
 
-            h_pred_pts = (h_exp_ortg / 100.0) * expected_pace + 1.2
-            a_pred_pts = (a_exp_ortg / 100.0) * expected_pace - 1.2
-            h_net, a_net, metric_name = h_ctx["net_rtg"], a_ctx["net_rtg"], "공수마진(NetRtg)"
-            pace_txt = f"예상 페이스 {expected_pace:.1f}"
-        else:
-            h_ctx = get_nba_fallback_context(home_id, game["game_date_et"], fallback_stats, league_avg_ppg)
-            a_ctx = get_nba_fallback_context(away_id, game["game_date_et"], fallback_stats, league_avg_ppg)
+        h_pred_pts = h_st["ppg_for"] + (a_st["ppg_agn"] - league_avg_ppg) + 1.2
+        a_pred_pts = a_st["ppg_for"] + (h_st["ppg_agn"] - league_avg_ppg) - 1.2
 
-            h_pred_pts = h_ctx["eff_for"] + (a_ctx["eff_agn"] - league_avg_ppg) + 1.2
-            a_pred_pts = a_ctx["eff_for"] + (h_ctx["eff_agn"] - league_avg_ppg) - 1.2
-            h_net, a_net, metric_name = h_ctx["net_ppg"], a_ctx["net_ppg"], "득실점마진(PPG)"
-            pace_txt = "득실점 백업모델"
-
-        if h_ctx["is_b2b"]:
+        if h_b2b:
             h_pred_pts -= 1.5
             a_pred_pts += 0.8
-        if a_ctx["is_b2b"]:
+        if a_b2b:
             a_pred_pts -= 1.5
             h_pred_pts += 0.8
 
@@ -507,20 +495,21 @@ def run_nba_module(now_kst: pd.Timestamp):
                 f" ({odds_info['book_count']}개사){ev_badge}"
             )
 
+        h_net, a_net = h_st["net_ppg"], a_st["net_ppg"]
         reasons = []
         if abs(h_net - a_net) >= 3.5:
             better = home_code if h_net > a_net else away_code
-            reasons.append(f"• {metric_name} {better} 우위 (홈 {h_net:+.1f} vs 원정 {a_net:+.1f})")
+            reasons.append(f"• 평균 득실점 마진 {better} 우위 (홈 {h_net:+.1f} vs 원정 {a_net:+.1f})")
         else:
-            reasons.append(f"• {metric_name} 호각세 (홈 {h_net:+.1f} vs 원정 {a_net:+.1f})")
+            reasons.append(f"• 평균 득실점 마진 호각세 (홈 {h_net:+.1f} vs 원정 {a_net:+.1f})")
 
-        if h_ctx["is_b2b"] or a_ctx["is_b2b"]:
-            b2b_list = [t for cond, t in [(h_ctx["is_b2b"], f"홈 {home_code}"), (a_ctx["is_b2b"], f"원정 {away_code}")] if cond]
+        if h_b2b or a_b2b:
+            b2b_list = [t for cond, t in [(h_b2b, f"홈 {home_code}"), (a_b2b, f"원정 {away_code}")] if cond]
             reasons.append(f"• ⚠️ 백투백(연전) 피로도: {', '.join(b2b_list)}")
 
-        reasons.append(f"• 최근 5경기: {away_code}({a_ctx['recent_5']}) vs {home_code}({h_ctx['recent_5']})")
+        reasons.append(f"• 최근 경기 흐름: {away_code}({a_rec5}) vs {home_code}({h_rec5})")
         kst_str = format_kst_datetime(game["dt_kst"])
-        match_id_str = f"NBA_{game['gameId']}"
+        match_id_str = f"NBA_{game['game_id']}"
 
         reports.append(
             f"--------------------------------------------------\n"
@@ -529,7 +518,7 @@ def run_nba_module(now_kst: pd.Timestamp):
             f"📊 예측 스코어 : {away_code} {a_pred_pts:.1f} - {h_pred_pts:.1f} {home_code}\n"
             f"📈 승리 확률   : {away_code} {away_win_prob:.1f}% | {home_code} {home_win_prob:.1f}%"
             f"{odds_line}\n"
-            f"🔥 예상 총득점 : {total_pts:.1f}점 ({pace_txt})\n"
+            f"🔥 예상 총득점 : {total_pts:.1f}점\n"
             f"🎯 픽스터 추천 : [{pick_team} 승] (예상핸디 {spread_str}) | {conf}\n"
             f"📝 분석 근거   :\n" + "\n".join(reasons)
         )
@@ -554,7 +543,7 @@ def run_nba_module(now_kst: pd.Timestamp):
             "pick_ev": round(pick_ev, 1) if pick_ev is not None else None,
             "tier": tier_score,
             "conf_label": conf,
-            "extra_info": f"예상 총득점 {total_pts:.1f}점 ({pace_txt}) | 예상핸디 {spread_str}",
+            "extra_info": f"예상 총득점 {total_pts:.1f}점 | 예상핸디 {spread_str}",
             "reasons": "\n".join(reasons),
         })
 
@@ -1191,7 +1180,6 @@ def build_blogger_html(now_kst: pd.Timestamp, top_picks: list, analyses: list, s
     total_stake = sum(int(r["stake"]) for r in settled)
     roi = (net_profit / total_stake * 100) if total_stake else 0.0
 
-    # 1. BEST PICKS 테이블 행
     sorted_picks = sorted(top_picks, key=lambda x: (x["tier"], x["prob"]), reverse=True)[:10]
     pick_rows_html = ""
     for idx, p in enumerate(sorted_picks, 1):
@@ -1220,7 +1208,6 @@ def build_blogger_html(now_kst: pd.Timestamp, top_picks: list, analyses: list, s
     if not pick_rows_html:
         pick_rows_html = '<tr><td colspan="6" style="padding:18px;text-align:center;color:#64748b;">현재 추천 기준에 부합하는 경기가 없습니다.</td></tr>'
 
-    # 2. 상세 분석 카드
     analysis_cards_html = ""
     for a in analyses[:16]:
         probs_txt = (
