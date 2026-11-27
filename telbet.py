@@ -31,8 +31,9 @@ _sb_client = (
     else None
 )
 
-# 구글 블로거 API 설정 (Secrets에 등록 시 자동 발행)
+# 구글 블로거 API 설정 (한국어 + 영문 블로그 동시 지원)
 BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID", "")
+BLOGGER_EN_BLOG_ID = os.getenv("BLOGGER_EN_BLOG_ID", "")
 BLOGGER_CLIENT_ID = os.getenv("BLOGGER_CLIENT_ID", "")
 BLOGGER_CLIENT_SECRET = os.getenv("BLOGGER_CLIENT_SECRET", "")
 BLOGGER_REFRESH_TOKEN = os.getenv("BLOGGER_REFRESH_TOKEN", "")
@@ -138,13 +139,6 @@ def is_telegram_enabled() -> bool:
     token_ok = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN.strip() and "여기에_" not in TELEGRAM_BOT_TOKEN)
     chan_ok = bool(TELEGRAM_CHANNEL_ID and TELEGRAM_CHANNEL_ID.strip() and "여기에_" not in TELEGRAM_CHANNEL_ID)
     return token_ok and chan_ok
-
-
-def is_blogger_enabled() -> bool:
-    return all(
-        bool(v and v.strip())
-        for v in (BLOGGER_BLOG_ID, BLOGGER_CLIENT_ID, BLOGGER_CLIENT_SECRET, BLOGGER_REFRESH_TOKEN)
-    )
 
 
 def normalize_team_name(name: str) -> str:
@@ -298,7 +292,6 @@ def fetch_espn_nba_games(now_kst: pd.Timestamp) -> list[dict]:
     seen_ids = set()
     games = []
 
-    # 최근 7일(정산/연전/최근5경기용) + 향후 3일(일정/예측용)
     for offset in range(-7, SCHEDULE_DAYS + 1):
         d_str = (now_et + pd.Timedelta(days=offset)).strftime("%Y%m%d")
         url = f"{ESPN_NBA_BASE}/site/v2/sports/basketball/nba/scoreboard"
@@ -333,7 +326,7 @@ def fetch_espn_nba_games(now_kst: pd.Timestamp) -> list[dict]:
             date_et = dt_utc.tz_convert("America/New_York").strftime("%Y-%m-%d")
 
             st_type = comp.get("status", {}).get("type", {})
-            state = st_type.get("state", "pre")  # pre, in, post
+            state = st_type.get("state", "pre")
             detail = st_type.get("shortDetail") or st_type.get("detail") or ""
 
             def extract_rec(comp_obj):
@@ -1096,7 +1089,7 @@ def build_virtual_wallet_report(records: list[dict], settled_msgs: list[str], pl
 
 
 # =========================================================
-# 📨 PART 4. 텔레그램 & 구글 블로거 자동 발송 모듈
+# 📨 PART 4. 텔레그램 & 구글 블로거(KR/EN) 자동 발송 모듈
 # =========================================================
 def split_message_chunks(text: str, max_len: int = 3800) -> list[str]:
     if len(text) <= max_len:
@@ -1164,7 +1157,35 @@ def send_telegram_channel(blocks: list[str]):
         print(f"✅ 텔레그램 채널({TELEGRAM_CHANNEL_ID}) 발송 완료! ({sent_count}/{len(all_chunks)}건)")
 
 
-def build_blogger_html(now_kst: pd.Timestamp, top_picks: list, analyses: list, schedule_rows: list, ledger_records: list) -> tuple[str, str]:
+def to_en_text(text: str) -> str:
+    if not text:
+        return ""
+    replacements = [
+        ("라리가", "La Liga"), ("분데스리가", "Bundesliga"), ("세리에 A", "Serie A"), ("챔피언스리그", "Champions League"),
+        ("(월)", "(Mon)"), ("(화)", "(Tue)"), ("(수)", "(Wed)"), ("(목)", "(Thu)"), ("(금)", "(Fri)"), ("(토)", "(Sat)"), ("(일)", "(Sun)"),
+        ("⭐⭐⭐ (주력)", "⭐⭐⭐ (High Conf)"), ("⭐⭐ (일반)", "⭐⭐ (Standard)"), ("⭐ (박빙/패스권장)", "⭐ (Toss-up/Pass)"),
+        ("⭐ (박빙)", "⭐ (Toss-up)"), ("(박빙 ⭐)", "(Toss-up ⭐)"),
+        ("[승무패 패스 권장 - 이변 주의 ⭐]", "[Pass Recommended - Upset Alert ⭐]"),
+        ("승/무 (1X) 추천", "1X (Win/Draw)"), ("무/패 (X2) 추천", "X2 (Draw/Away)"),
+        ("(홈 승)", "(Home Win)"), ("(원정 승)", "(Away Win)"), (" 홈 승", " Home Win"), (" 원정 승", " Away Win"),
+        ("무승부 (무승부)", "Draw"), ("무승부", "Draw"), (" 승", " Win"),
+        ("기대득점 ", "xG: "), ("골 vs ", " vs "), ("골", ""),
+        ("예상 총득점 ", "Proj. Total "), ("점 | 예상핸디 ", " pts | Proj. Spread "), ("점", " pts"),
+        ("득실점 백업모델", "PPG Model"), ("예상 페이스 ", "Pace "),
+        ("2.5 오버 추천", "Over 2.5"), ("2.5 언더 추천", "Under 2.5"), ("기준점 2.5 관망 (오버", "O/U 2.5 Watch (Over"),
+        ("양팀 득점 높음", "BTTS Likely"), ("양팀 득점", "BTTS"), ("유력:", "Top Scores:"),
+        ("• 평균 득실점 마진 ", "• PPG Margin: "), ("• 공수마진(NetRtg) ", "• NetRtg: "),
+        (" 우위 ", " edge "), (" 호각세 ", " even "),
+        ("• ⚠️ 백투백(연전) 피로도:", "• ⚠️ B2B Fatigue:"), ("• 최근 경기 흐름:", "• Recent Form:"), ("• 최근 5경기:", "• Last 5:"),
+        ("홈 ", "Home "), ("원정 ", "Away "), ("정보없음", "N/A"), ("기록없음", "N/A"),
+    ]
+    res = str(text)
+    for k, v in replacements:
+        res = res.replace(k, v)
+    return res
+
+
+def build_blogger_html(now_kst: pd.Timestamp, top_picks: list, analyses: list, ledger_records: list) -> tuple[str, str]:
     end_kst = now_kst + pd.Timedelta(days=2)
     date_range_str = f"{now_kst.strftime('%m/%d')} ~ {end_kst.strftime('%m/%d')}"
     ampm = "오전" if now_kst.hour < 12 else "오후"
@@ -1184,25 +1205,25 @@ def build_blogger_html(now_kst: pd.Timestamp, top_picks: list, analyses: list, s
     pick_rows_html = ""
     for idx, p in enumerate(sorted_picks, 1):
         tier_badge = (
-            '<span style="background:#fef3c7;color:#b45309;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐⭐ 주력</span>'
+            '<span style="display:inline-block;white-space:nowrap;background:#fef3c7;color:#b45309;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐⭐ 주력</span>'
             if p["tier"] == 3
-            else '<span style="background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐ 일반</span>'
+            else '<span style="display:inline-block;white-space:nowrap;background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐ 일반</span>'
         )
         odd_str = f"{p['odd']:.2f}" if p.get("odd") else "-"
         ev_badge = ""
         if p.get("ev") is not None:
             ev_bg = "#d1fae5;color:#065f46" if p["ev"] >= 5 else "#f1f5f9;color:#334155"
             gem = " 💎" if p["ev"] >= 5 else ""
-            ev_badge = f' <span style="background:{ev_bg};padding:3px 7px;border-radius:6px;font-size:12px;font-weight:700;">EV {p["ev"]:+.1f}%{gem}</span>'
+            ev_badge = f' <span style="display:inline-block;white-space:nowrap;background:{ev_bg};padding:3px 7px;border-radius:6px;font-size:12px;font-weight:700;">EV {p["ev"]:+.1f}%{gem}</span>'
 
         pick_rows_html += f"""
         <tr style="border-bottom:1px solid #e2e8f0;">
           <td style="padding:12px 8px;text-align:center;color:#64748b;font-weight:600;">{idx}</td>
-          <td style="padding:12px 8px;">{esc(p['sport'])}</td>
+          <td style="padding:12px 8px;white-space:nowrap;">{esc(p['sport'])}</td>
           <td style="padding:12px 8px;font-weight:600;color:#0f172a;">{esc(p['match'])}</td>
           <td style="padding:12px 8px;"><b>{esc(p['pick'])}</b> ({p['prob']:.1f}%) {tier_badge}</td>
-          <td style="padding:12px 8px;">{odd_str}{ev_badge}</td>
-          <td style="padding:12px 8px;color:#475569;font-size:13px;">{esc(p['time'])}</td>
+          <td style="padding:12px 8px;white-space:nowrap;">{odd_str}{ev_badge}</td>
+          <td style="padding:12px 8px;color:#475569;font-size:13px;white-space:nowrap;">{esc(p['time'])}</td>
         </tr>"""
 
     if not pick_rows_html:
@@ -1231,72 +1252,144 @@ def build_blogger_html(now_kst: pd.Timestamp, top_picks: list, analyses: list, s
           <div style="font-size:13px;font-weight:700;color:#059669;">🎯 AI 추천: {esc(a['pick_label'])} · {esc(a['conf_label'])}</div>
         </div>"""
 
-    if not analysis_cards_html:
-        analysis_cards_html = '<p style="color:#64748b;">예정된 분석 경기가 없습니다.</p>'
-
     html_body = f"""
 <div style="max-width:860px;margin:0 auto;font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',sans-serif;line-height:1.6;color:#1e293b;">
   <div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a8a 100%);color:#ffffff;padding:24px 26px;border-radius:14px;margin-bottom:18px;">
     <div style="font-size:22px;font-weight:800;margin-bottom:6px;">🤖 AI 스포츠 픽스터 통합 리포트 ({date_range_str})</div>
     <div style="font-size:13px;color:#cbd5e1;">생성 시각: {esc(format_kst_datetime(now_kst))} | 대상 종목: NBA · EPL · 라리가 · 분데스리가 · 세리에 A · 챔피언스리그</div>
   </div>
-
   <div style="background:#f0f7ff;border:1px solid #bfdbfe;border-radius:12px;padding:18px 20px;margin-bottom:20px;">
     <div style="font-size:15px;font-weight:700;color:#1e3a8a;margin-bottom:6px;">📊 실시간 AI 대시보드 &amp; 커뮤니티 오픈!</div>
-    <div style="font-size:14px;color:#334155;margin-bottom:14px;">
-      실시간 경기 일정, 누적 가상배팅 성적표, 회원 커뮤니티 게시판은 웹사이트에서 바로 확인하실 수 있습니다.
-    </div>
+    <div style="font-size:14px;color:#334155;margin-bottom:14px;">실시간 경기 일정, 누적 가상배팅 성적표, 회원 커뮤니티 게시판은 웹사이트에서 바로 확인하실 수 있습니다.</div>
     <a href="{esc(WEB_SITE_URL)}" target="_blank" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:700;margin-right:8px;margin-bottom:6px;">🌐 AI 픽스터 웹사이트 바로가기</a>
     <a href="{esc(TELEGRAM_CHANNEL_URL)}" target="_blank" style="display:inline-block;background:#0284c7;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:700;margin-bottom:6px;">✈️ 텔레그램 채널 바로가기</a>
   </div>
-
-  <p style="font-size:14px;color:#334155;margin-bottom:22px;">
-    다가오는 주요 NBA 및 유럽 5대 프로축구 리그 경기의 AI 통계 모델 예측 리포트입니다. 핵심 주력 픽 TOP 10과 누적 가상배팅 성적, 상세 기대 득점 및 해외 배당 기댓값(EV)을 확인해 보세요.
-  </p>
-
-  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">
-    🏆 오늘의 AI 픽스터 핵심 추천 요약 (BEST PICKS)
-  </div>
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">🏆 오늘의 AI 픽스터 핵심 추천 요약 (BEST PICKS)</div>
   <div style="overflow-x:auto;border:1px solid #e2e8f0;border-radius:12px;background:#ffffff;margin-bottom:26px;">
-    <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:620px;">
-      <thead>
-        <tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;color:#475569;text-align:left;">
-          <th style="padding:12px 8px;text-align:center;">순위</th>
-          <th style="padding:12px 8px;">종목/리그</th>
-          <th style="padding:12px 8px;">매치업</th>
-          <th style="padding:12px 8px;">AI 추천 픽 (확률)</th>
-          <th style="padding:12px 8px;">배당 / 기댓값(EV)</th>
-          <th style="padding:12px 8px;">경기 일시 (KST)</th>
-        </tr>
-      </thead>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:650px;">
+      <thead><tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;color:#475569;text-align:left;">
+        <th style="padding:12px 8px;text-align:center;">순위</th><th style="padding:12px 8px;">종목/리그</th><th style="padding:12px 8px;">매치업</th><th style="padding:12px 8px;">AI 추천 픽 (확률)</th><th style="padding:12px 8px;">배당 / 기댓값(EV)</th><th style="padding:12px 8px;">경기 일시 (KST)</th>
+      </tr></thead>
       <tbody>{pick_rows_html}</tbody>
     </table>
   </div>
-
-  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">
-    💵 AI 가상 배팅 누적 성적표 (1만원 기준)
-  </div>
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">💵 AI 가상 배팅 누적 성적표 (1만원 기준)</div>
   <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;font-size:14px;margin-bottom:26px;">
     <b>누적 전적:</b> {total_games}전 {wins}승 {losses}패 (적중률 {hit_rate:.1f}%) &nbsp;|&nbsp;
     <b>순수익:</b> <span style="color:{'#059669' if net_profit >= 0 else '#e11d48'};font-weight:700;">{net_profit:+,d}원</span> (ROI {roi:+.1f}%)
   </div>
-
-  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">
-    🔍 경기별 AI 상세 분석
-  </div>
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">🔍 경기별 AI 상세 분석</div>
   {analysis_cards_html}
-
-  <p style="font-size:12px;color:#94a3b8;margin-top:28px;border-top:1px solid #e2e8f0;padding-top:12px;">
-    ※ 본 게시물은 통계 모델 기반 자동 분석 리포트이며, 가상 배팅 시뮬레이션 결과는 실제 수익을 보장하지 않습니다.
-  </p>
-</div>
-"""
+  <p style="font-size:12px;color:#94a3b8;margin-top:28px;border-top:1px solid #e2e8f0;padding-top:12px;">※ 본 게시물은 통계 모델 기반 자동 분석 리포트이며, 가상 배팅 시뮬레이션 결과는 실제 수익을 보장하지 않습니다.</p>
+</div>"""
     return post_title, html_body
 
 
-def publish_to_blogger(title: str, html_content: str, labels: list[str] | None = None):
-    if not is_blogger_enabled():
-        print("\nℹ️ [블로거] API 설정이 없어 블로그 자동 발행은 건너뜁니다.")
+def build_blogger_html_en(now_kst: pd.Timestamp, top_picks: list, analyses: list, ledger_records: list) -> tuple[str, str]:
+    end_kst = now_kst + pd.Timedelta(days=2)
+    date_range_str = f"{now_kst.strftime('%m/%d')} - {end_kst.strftime('%m/%d')}"
+    ampm = "AM" if now_kst.hour < 12 else "PM"
+    post_title = f"🤖 AI Sports Pickster Daily Report ({date_range_str} {ampm} KST)"
+    esc = html_lib.escape
+
+    settled = [r for r in ledger_records if r["status"] in ("WON", "LOST")]
+    wins = sum(1 for r in settled if r["status"] == "WON")
+    losses = sum(1 for r in settled if r["status"] == "LOST")
+    total_games = wins + losses
+    hit_rate = (wins / total_games * 100) if total_games else 0.0
+    net_profit = sum(int(r["profit"]) for r in settled)
+    total_stake = sum(int(r["stake"]) for r in settled)
+    roi = (net_profit / total_stake * 100) if total_stake else 0.0
+    units = net_profit / float(BET_STAKE_KRW)
+
+    sorted_picks = sorted(top_picks, key=lambda x: (x["tier"], x["prob"]), reverse=True)[:10]
+    pick_rows_html = ""
+    for idx, p in enumerate(sorted_picks, 1):
+        tier_badge = (
+            '<span style="display:inline-block;white-space:nowrap;background:#fef3c7;color:#b45309;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐⭐ High Conf</span>'
+            if p["tier"] == 3
+            else '<span style="display:inline-block;white-space:nowrap;background:#e0e7ff;color:#3730a3;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:700;">⭐⭐ Standard</span>'
+        )
+        odd_str = f"{p['odd']:.2f}" if p.get("odd") else "-"
+        ev_badge = ""
+        if p.get("ev") is not None:
+            ev_bg = "#d1fae5;color:#065f46" if p["ev"] >= 5 else "#f1f5f9;color:#334155"
+            gem = " 💎" if p["ev"] >= 5 else ""
+            ev_badge = f' <span style="display:inline-block;white-space:nowrap;background:{ev_bg};padding:3px 7px;border-radius:6px;font-size:12px;font-weight:700;">EV {p["ev"]:+.1f}%{gem}</span>'
+
+        pick_rows_html += f"""
+        <tr style="border-bottom:1px solid #e2e8f0;">
+          <td style="padding:12px 8px;text-align:center;color:#64748b;font-weight:600;">{idx}</td>
+          <td style="padding:12px 8px;white-space:nowrap;">{esc(to_en_text(p['sport']))}</td>
+          <td style="padding:12px 8px;font-weight:600;color:#0f172a;">{esc(p['match'])}</td>
+          <td style="padding:12px 8px;"><b>{esc(to_en_text(p['pick']))}</b> ({p['prob']:.1f}%) {tier_badge}</td>
+          <td style="padding:12px 8px;white-space:nowrap;">{odd_str}{ev_badge}</td>
+          <td style="padding:12px 8px;color:#475569;font-size:13px;white-space:nowrap;">{esc(to_en_text(p['time']))}</td>
+        </tr>"""
+
+    if not pick_rows_html:
+        pick_rows_html = '<tr><td colspan="6" style="padding:18px;text-align:center;color:#64748b;">No high-confidence picks available right now.</td></tr>'
+
+    analysis_cards_html = ""
+    for a in analyses[:16]:
+        probs_txt = (
+            f"Home {a['home_prob']:.1f}% | Draw {a['draw_prob']:.1f}% | Away {a['away_prob']:.1f}%"
+            if a.get("draw_prob") is not None
+            else f"Away {a['away_prob']:.1f}% | Home {a['home_prob']:.1f}%"
+        )
+        analysis_cards_html += f"""
+        <div style="border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin-bottom:14px;background:#ffffff;">
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:#64748b;margin-bottom:6px;">
+            <span style="font-weight:700;color:#1d4ed8;">{esc(to_en_text(a['sport']))}</span>
+            <span>{esc(to_en_text(a['kickoff_kst']))}</span>
+          </div>
+          <div style="font-size:16px;font-weight:700;color:#0f172a;margin-bottom:4px;">
+            {esc(a['home_team'])} (Home) vs {esc(a['away_team'])} (Away)
+          </div>
+          <div style="font-size:13px;color:#1e40af;margin-bottom:6px;">{esc(to_en_text(a['pred_summary']))}</div>
+          <div style="font-size:13px;color:#334155;margin-bottom:4px;">📈 Win Prob: {probs_txt}</div>
+          <div style="font-size:13px;color:#475569;margin-bottom:8px;">🔥 {esc(to_en_text(a['extra_info']))}</div>
+          <div style="background:#f8fafc;border-radius:8px;padding:10px;font-size:12px;color:#475569;white-space:pre-line;margin-bottom:8px;">{esc(to_en_text(a['reasons']))}</div>
+          <div style="font-size:13px;font-weight:700;color:#059669;">🎯 AI Pick: {esc(to_en_text(a['pick_label']))} · {esc(to_en_text(a['conf_label']))}</div>
+        </div>"""
+
+    en_web_url = WEB_SITE_URL.rstrip("/") + "/?lang=en"
+    html_body = f"""
+<div style="max-width:860px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.6;color:#1e293b;">
+  <div style="background:linear-gradient(135deg,#0f172a 0%,#1e3a8a 100%);color:#ffffff;padding:24px 26px;border-radius:14px;margin-bottom:18px;">
+    <div style="font-size:22px;font-weight:800;margin-bottom:6px;">🤖 AI Sports Pickster Daily Report ({date_range_str})</div>
+    <div style="font-size:13px;color:#cbd5e1;">Generated: {esc(to_en_text(format_kst_datetime(now_kst)))} | Coverage: NBA · EPL · La Liga · Bundesliga · Serie A · UCL</div>
+  </div>
+  <div style="background:#f0f7ff;border:1px solid #bfdbfe;border-radius:12px;padding:18px 20px;margin-bottom:20px;">
+    <div style="font-size:15px;font-weight:700;color:#1e3a8a;margin-bottom:6px;">📊 Live AI Dashboard &amp; Community Tracker</div>
+    <div style="font-size:14px;color:#334155;margin-bottom:14px;">Explore live schedules, transparent ROI tracking, and community discussions on our web dashboard.</div>
+    <a href="{esc(en_web_url)}" target="_blank" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:700;margin-right:8px;margin-bottom:6px;">🌐 Open Live Dashboard (EN)</a>
+    <a href="{esc(TELEGRAM_CHANNEL_URL)}" target="_blank" style="display:inline-block;background:#0284c7;color:#ffffff;text-decoration:none;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:700;margin-bottom:6px;">✈️ Join Telegram Channel</a>
+  </div>
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">🏆 Today's AI BEST PICKS</div>
+  <div style="overflow-x:auto;border:1px solid #e2e8f0;border-radius:12px;background:#ffffff;margin-bottom:26px;">
+    <table style="width:100%;border-collapse:collapse;font-size:13px;min-width:650px;">
+      <thead><tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;color:#475569;text-align:left;">
+        <th style="padding:12px 8px;text-align:center;">#</th><th style="padding:12px 8px;">League</th><th style="padding:12px 8px;">Matchup</th><th style="padding:12px 8px;">AI Pick (Prob)</th><th style="padding:12px 8px;">Odds / +EV</th><th style="padding:12px 8px;">Kickoff (KST)</th>
+      </tr></thead>
+      <tbody>{pick_rows_html}</tbody>
+    </table>
+  </div>
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">💵 Virtual Model Track Record</div>
+  <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;font-size:14px;margin-bottom:26px;">
+    <b>Record:</b> {wins}W - {losses}L ({hit_rate:.1f}% Win Rate) &nbsp;|&nbsp;
+    <b>Net Units:</b> <span style="color:{'#059669' if units >= 0 else '#e11d48'};font-weight:700;">{units:+.2f}u</span> (ROI {roi:+.1f}%)
+  </div>
+  <div style="border-left:5px solid #1d4ed8;padding-left:12px;font-size:18px;font-weight:800;color:#0f172a;margin:24px 0 12px;">🔍 Match-by-Match Statistical Breakdown</div>
+  {analysis_cards_html}
+  <p style="font-size:12px;color:#94a3b8;margin-top:28px;border-top:1px solid #e2e8f0;padding-top:12px;">Disclaimer: All predictions are generated by statistical models for informational purposes only and do not guarantee future profits.</p>
+</div>"""
+    return post_title, html_body
+
+
+def publish_to_blogger(title: str, html_content: str, labels: list[str] | None = None, blog_id: str | None = None):
+    target_blog_id = (blog_id or BLOGGER_BLOG_ID or "").strip()
+    if not (target_blog_id and BLOGGER_CLIENT_ID and BLOGGER_CLIENT_SECRET and BLOGGER_REFRESH_TOKEN):
         return
 
     try:
@@ -1313,10 +1406,10 @@ def publish_to_blogger(title: str, html_content: str, labels: list[str] | None =
         token_resp.raise_for_status()
         access_token = token_resp.json()["access_token"]
 
-        post_url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOGGER_BLOG_ID}/posts/"
+        post_url = f"https://www.googleapis.com/blogger/v3/blogs/{target_blog_id}/posts/"
         payload = {
             "kind": "blogger#post",
-            "blog": {"id": BLOGGER_BLOG_ID},
+            "blog": {"id": target_blog_id},
             "title": title,
             "content": html_content,
             "labels": labels or ["NBA", "유럽축구", "AI픽스터"],
@@ -1327,10 +1420,12 @@ def publish_to_blogger(title: str, html_content: str, labels: list[str] | None =
             json=payload,
             timeout=25,
         )
-        res.raise_for_status()
+        if not res.ok:
+            print(f"⚠️ [블로거] 포스팅 실패 ({target_blog_id}): [{res.status_code}] {res.text}")
+            return
         print(f"📝 [블로거] 자동 포스팅 완료! -> {res.json().get('url', '')}")
     except Exception as e:
-        print(f"⚠️ [블로거] 포스팅 실패: {e}")
+        print(f"⚠️ [블로거] 포스팅 실패 ({target_blog_id}): {e}")
 
 
 # =========================================================
@@ -1458,8 +1553,12 @@ def execute_bot(run_nba: bool, run_soccer: bool):
         send_telegram_channel(tg_blocks)
 
     if "--no-blog" not in sys.argv and all_analyses:
-        blog_title, blog_html = build_blogger_html(now_kst, all_top_picks, all_analyses, all_schedule_rows, ledger_records)
-        publish_to_blogger(blog_title, blog_html)
+        if BLOGGER_BLOG_ID:
+            blog_title, blog_html = build_blogger_html(now_kst, all_top_picks, all_analyses, ledger_records)
+            publish_to_blogger(blog_title, blog_html, labels=["NBA", "유럽축구", "AI픽스터"], blog_id=BLOGGER_BLOG_ID)
+        if BLOGGER_EN_BLOG_ID:
+            en_title, en_html = build_blogger_html_en(now_kst, all_top_picks, all_analyses, ledger_records)
+            publish_to_blogger(en_title, en_html, labels=["NBA", "Soccer", "AI Picks", "Sports Analytics"], blog_id=BLOGGER_EN_BLOG_ID)
 
 
 def run_24h_auto_loop():
@@ -1497,7 +1596,7 @@ def main():
         return
 
     print("==================================================")
-    print("🤖 AI 스포츠 픽스터 통합 봇 (텔레그램 + 웹 + 블로거)")
+    print("🤖 AI 스포츠 픽스터 통합 봇 (텔레그램 + 웹 + KR/EN 블로거)")
     print("==================================================")
     print("1. 1회 전체 실행 (NBA + 유럽축구)")
     print("2. 🏀 NBA만 보기")
